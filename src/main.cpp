@@ -3,11 +3,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+// CONFIG — Update these in src/secrets.h
 // ==========================================
-// CONFIG — Update these for your setup
-// ==========================================
-#define WIFI_SSID      "YOUR_WIFI"
-#define WIFI_PASSWORD  "YOUR_PASSWORD"
+#include "secrets.h"
 
 // Lightning AI server — the path after the host
 const char* SERVER_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
