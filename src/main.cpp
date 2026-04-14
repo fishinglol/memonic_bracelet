@@ -8,8 +8,10 @@
 // ==========================================
 // CONFIG
 // ==========================================
-const char* SERVER_URL = "https://8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai/api/esp32-audio";
-const char* ENROLL_URL = "https://8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai/api/esp32-enroll/";
+const char* SERVER_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
+const int   SERVER_PORT = 443;
+const char* AUDIO_PATH  = "/api/esp32-audio";
+const char* ENROLL_PATH = "/api/esp32-enroll/";
 
 // Enrollment config
 #define ENROLL_SECONDS  7
@@ -168,11 +170,11 @@ int recordAudio(int16_t* audioData, int maxSamples) {
 }
 
 // ==========================================
-// SEND AUDIO VIA HTTP POST (with retry)
+// SEND AUDIO VIA RAW HTTPS POST (Bypasses HTTPClient bugs)
 // ==========================================
-bool sendAudio(uint8_t* wavBuf, uint32_t wavSize) {
+bool sendAudioRaw(const char* path, uint8_t* wavBuf, uint32_t wavSize) {
     for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        Serial.printf("📤 Sending attempt %d/%d (%u bytes)...\n", attempt, MAX_RETRIES, wavSize);
+        Serial.printf("📤 Sending attempt %d/%d (%u bytes) to %s \n", attempt, MAX_RETRIES, wavSize, path);
 
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("   WiFi lost — reconnecting...");
@@ -181,30 +183,57 @@ bool sendAudio(uint8_t* wavBuf, uint32_t wavSize) {
 
         WiFiClientSecure client;
         client.setInsecure();
+        client.setTimeout(60); // 60s timeout for AI processing
 
-        HTTPClient http;
-        http.setTimeout(HTTP_TIMEOUT_MS);
-
-        if (!http.begin(client, SERVER_URL)) {
-            Serial.println("   ❌ http.begin() failed");
+        if (!client.connect(SERVER_HOST, SERVER_PORT)) {
+            Serial.println("   ❌ HTTPS connection FAILED!");
             delay(2000);
             continue;
         }
 
-        http.addHeader("Content-Type", "application/octet-stream");
+        // Send HTTP headers manually
+        client.printf("POST %s HTTP/1.1\r\n", path);
+        client.printf("Host: %s\r\n", SERVER_HOST);
+        client.printf("Content-Type: application/octet-stream\r\n");
+        client.printf("Content-Length: %u\r\n", wavSize);
+        client.printf("Connection: close\r\n");
+        client.printf("\r\n");
 
-        int httpCode = http.POST(wavBuf, wavSize);
+        // Send body in chunks so we don't blow up the WiFiClient buffer
+        uint32_t offset = 0;
+        while (offset < wavSize) {
+            uint32_t chunkSize = wavSize - offset;
+            if (chunkSize > 4096) chunkSize = 4096;
+            client.write(wavBuf + offset, chunkSize);
+            offset += chunkSize;
+        }
 
-        if (httpCode > 0) {
-            String response = http.getString();
-            Serial.printf("   ✅ Server responded (%d):\n", httpCode);
-            Serial.println(response);
-            http.end();
+        Serial.println("   ✅ Uploaded. Waiting for server response...");
+
+        // Read response
+        String responseLine = client.readStringUntil('\n');
+        responseLine.trim();
+        
+        // Skip remaining headers
+        while (client.connected()) {
+            String line = client.readStringUntil('\n');
+            if (line == "\r" || line == "") break; 
+        }
+
+        // Read body
+        String responseBody = "";
+        while (client.available()) {
+            responseBody += (char)client.read();
+        }
+        client.stop();
+
+        if (responseLine.indexOf("200 OK") != -1) {
+            Serial.println("   ✅ Server responded (200):");
+            Serial.println(responseBody);
             return true;
         } else {
-            Serial.printf("   ❌ HTTP error: %s (code %d)\n",
-                          http.errorToString(httpCode).c_str(), httpCode);
-            http.end();
+            Serial.printf("   ❌ Server error: %s\n", responseLine.c_str());
+            Serial.println(responseBody);
 
             if (attempt < MAX_RETRIES) {
                 int waitMs = attempt * 3000;
@@ -246,7 +275,7 @@ void recordAndSend() {
     Serial.printf("   Recorded %d samples\n", samples);
 
     // Send with retry
-    sendAudio(wavBuf, wavSize);
+    sendAudioRaw(AUDIO_PATH, wavBuf, wavSize);
 
     // Free buffer
     free(wavBuf);
@@ -297,30 +326,11 @@ void enrollVoice(String userId) {
     int samples = recordAudio(audioData, ENROLL_SAMPLES);
     Serial.printf("   Recorded %d samples (%.1fs)\n", samples, (float)samples / SAMPLE_RATE);
 
-    // Build enrollment URL
-    String enrollUrl = String(ENROLL_URL) + userId;
-    Serial.printf("📤 Sending to: %s\n", enrollUrl.c_str());
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.setTimeout(HTTP_TIMEOUT_MS);
-
-    if (http.begin(client, enrollUrl)) {
-        http.addHeader("Content-Type", "application/octet-stream");
-        int httpCode = http.POST(wavBuf, wavSize);
-
-        if (httpCode > 0) {
-            Serial.printf("✅ Server responded (%d):\n", httpCode);
-            Serial.println(http.getString());
-        } else {
-            Serial.printf("❌ HTTP error: %s\n", http.errorToString(httpCode).c_str());
-        }
-        http.end();
-    } else {
-        Serial.println("❌ Failed to connect");
-    }
+    // Build enrollment Path
+    String enrollPath = String(ENROLL_PATH) + userId;
+    
+    // Send 
+    sendAudioRaw(enrollPath.c_str(), wavBuf, wavSize);
 
     free(wavBuf);
     Serial.printf("Free heap after: %u bytes\n", ESP.getFreeHeap());
