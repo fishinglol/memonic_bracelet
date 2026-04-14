@@ -1,19 +1,17 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WebSocketsClient.h>
+#include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD
 
-// CONFIG — Update credentials in src/secrets.h
 // ==========================================
-#include "secrets.h"
+// CONFIG
+// ==========================================
+const char* WS_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
+const int   WS_PORT = 443;
+const char* WS_PATH = "/ws/audio";
 
-// Lightning AI server
-const char* SERVER_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
-const char* AUDIO_PATH  = "/api/esp32-audio";
-const char* HEARTBEAT_PATH = "/update";
-const int   SERVER_PORT = 443;  // HTTPS
-
-// Audio config
+// Audio config (unchanged from original)
 #define I2S_SCK   5
 #define I2S_WS    4
 #define I2S_SD    6
@@ -22,47 +20,19 @@ const int   SERVER_PORT = 443;  // HTTPS
 #define RECORD_SECONDS 5
 #define SAMPLES_TOTAL  (SAMPLE_RATE * RECORD_SECONDS)
 
-// ==========================================
-// TIMING — millis()-based, non-blocking
-//
-// Heartbeat keeps the UI showing "Connected"
-// even between audio recordings.
-// ==========================================
-#define HEARTBEAT_INTERVAL_MS 10000   // ping server every 10s
-#define RECORD_INTERVAL_MS    20000   // record every 20s
-
-unsigned long lastHeartbeat = 0;
-unsigned long lastRecording = 0;
+// Timing
+#define RECORD_INTERVAL_MS  15000  // Record every 15 seconds
 
 // ==========================================
-// WAV HEADER — 44 bytes for 16-bit mono PCM
+// STATE
 // ==========================================
-void buildWavHeader(uint8_t* buf, uint32_t dataSize, uint32_t sampleRate) {
-    uint32_t fileSize = 36 + dataSize;
-    uint16_t channels = 1;
-    uint16_t bitsPerSample = 16;
-    uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
-    uint16_t blockAlign = channels * bitsPerSample / 8;
-
-    memcpy(buf + 0,  "RIFF", 4);
-    memcpy(buf + 4,  &fileSize, 4);
-    memcpy(buf + 8,  "WAVE", 4);
-    memcpy(buf + 12, "fmt ", 4);
-    uint32_t subchunk1Size = 16;
-    memcpy(buf + 16, &subchunk1Size, 4);
-    uint16_t audioFormat = 1;  // PCM
-    memcpy(buf + 20, &audioFormat, 2);
-    memcpy(buf + 22, &channels, 2);
-    memcpy(buf + 24, &sampleRate, 4);
-    memcpy(buf + 28, &byteRate, 4);
-    memcpy(buf + 32, &blockAlign, 2);
-    memcpy(buf + 34, &bitsPerSample, 2);
-    memcpy(buf + 36, "data", 4);
-    memcpy(buf + 40, &dataSize, 4);
-}
+WebSocketsClient webSocket;
+bool wsConnected = false;
+bool waitingForResponse = false;
+unsigned long lastRecordTime = 0;
 
 // ==========================================
-// I2S INIT
+// I2S INIT (same pin config as before)
 // ==========================================
 void initI2S() {
     i2s_config_t cfg = {
@@ -88,17 +58,14 @@ void initI2S() {
 }
 
 // ==========================================
-// WIFI — auto-reconnect, never crash
+// WIFI
 // ==========================================
-void ensureWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return;
-
+void connectWiFi() {
     Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
-    WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
         delay(500);
         Serial.print(".");
         attempts++;
@@ -107,124 +74,106 @@ void ensureWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
     } else {
-        Serial.println("\nWiFi not ready — will retry next loop");
+        Serial.println("\nWiFi FAILED — restarting...");
+        ESP.restart();
     }
 }
 
 // ==========================================
-// HEARTBEAT — tiny POST to /update
-//
-// Keeps the UI showing "Connected" between
-// audio recordings.  Uses minimal RAM.
+// WEBSOCKET EVENT HANDLER
 // ==========================================
-void sendHeartbeat() {
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(10);
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            wsConnected = false;
+            Serial.println("🔌 WebSocket disconnected — will auto-reconnect");
+            break;
 
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.println("  ♥ Heartbeat: server unreachable");
-        return;
+        case WStype_CONNECTED:
+            wsConnected = true;
+            waitingForResponse = false;
+            Serial.printf("🔌 WebSocket connected to: %s%s\n", WS_HOST, WS_PATH);
+            Serial.printf("   Free heap: %u bytes\n", ESP.getFreeHeap());
+            break;
+
+        case WStype_TEXT:
+            // Server sends JSON result after processing
+            Serial.println("\n📨 Server response:");
+            Serial.println((char*)payload);
+            Serial.println();
+            waitingForResponse = false;
+            break;
+
+        case WStype_ERROR:
+            Serial.printf("❌ WebSocket error (length: %u)\n", length);
+            break;
+
+        default:
+            break;
     }
-
-    const char* body = "{\"bracelet\":\"Connected\"}";
-    int bodyLen = strlen(body);
-
-    client.printf("POST %s HTTP/1.1\r\n", HEARTBEAT_PATH);
-    client.printf("Host: %s\r\n", SERVER_HOST);
-    client.print("Content-Type: application/json\r\n");
-    client.printf("Content-Length: %d\r\n", bodyLen);
-    client.print("Connection: close\r\n\r\n");
-    client.print(body);
-
-    // Drain response quickly (we don't care about the body)
-    unsigned long deadline = millis() + 5000;
-    while (client.connected() && millis() < deadline) {
-        if (client.available()) { client.read(); }
-        else { delay(10); }
-    }
-    client.stop();
-    Serial.println("  ♥ Heartbeat OK");
 }
 
 // ==========================================
-// RECORD & SEND — streaming, crash-safe
+// RECORD & STREAM via WebSocket
 //
-// ~1 KB RAM only (no big audio buffer).
-// All errors are caught — never crashes.
+// Protocol:
+//   1. Send TEXT "START"
+//   2. Send BINARY chunks (raw 16-bit PCM, 16kHz, mono)
+//   3. Send TEXT "STOP"
+//   4. Wait for JSON response
+//
+// RAM usage: ~1KB (256-sample I2S buf + 256-sample conversion buf)
 // ==========================================
-void recordAndSend() {
-    Serial.printf("\n🎙  Free heap: %u bytes\n", ESP.getFreeHeap());
-
-    uint32_t dataSize = SAMPLES_TOTAL * sizeof(int16_t);  // 160 000 bytes
-    uint32_t wavSize  = 44 + dataSize;
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(30);
-
-    Serial.println("   Connecting to server...");
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.println("   ✗ HTTPS connection FAILED — skipping this cycle");
+void recordAndStream() {
+    if (!wsConnected) {
+        Serial.println("⚠️  Not connected, skipping recording");
         return;
     }
-    Serial.println("   ✓ Connected!");
 
-    // HTTP headers
-    client.printf("POST %s HTTP/1.1\r\n", AUDIO_PATH);
-    client.printf("Host: %s\r\n", SERVER_HOST);
-    client.print("Content-Type: application/octet-stream\r\n");
-    client.printf("Content-Length: %u\r\n", wavSize);
-    client.print("Connection: close\r\n\r\n");
+    Serial.printf("\nFree heap before record: %u bytes\n", ESP.getFreeHeap());
 
-    // WAV header (44 bytes)
-    uint8_t wavHeader[44];
-    buildWavHeader(wavHeader, dataSize, SAMPLE_RATE);
-    client.write(wavHeader, 44);
+    // Signal server: start recording
+    webSocket.sendTXT("START");
+    delay(50);  // Let server process the command
 
-    // Stream I2S → server (low memory)
-    Serial.printf("   Recording & streaming %d seconds...\n", RECORD_SECONDS);
-    int32_t i2sBuf[128];
-    int16_t sampleBuf[128];
+    Serial.printf("🎤 Recording %d seconds...\n", RECORD_SECONDS);
+
+    int32_t i2sBuf[256];       // ~1KB — I2S read buffer (32-bit samples)
+    int16_t sampleBuf[256];    // ~512 bytes — converted 16-bit samples
     int totalSamples = 0;
+    int chunksSent = 0;
 
     while (totalSamples < SAMPLES_TOTAL) {
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
         int count = bytesRead / sizeof(int32_t);
 
+        // Limit to remaining samples
         int remaining = SAMPLES_TOTAL - totalSamples;
         if (count > remaining) count = remaining;
 
+        // Convert 32-bit I2S → 16-bit PCM
         for (int i = 0; i < count; i++) {
             sampleBuf[i] = (int16_t)(i2sBuf[i] >> 16);
         }
 
-        client.write((uint8_t*)sampleBuf, count * sizeof(int16_t));
+        // Send raw PCM chunk over WebSocket (binary)
+        webSocket.sendBIN((uint8_t*)sampleBuf, count * sizeof(int16_t));
         totalSamples += count;
+        chunksSent++;
+
+        // Keep WebSocket alive during recording
+        webSocket.loop();
     }
 
-    Serial.printf("   Sent %d samples. Reading response...\n", totalSamples);
+    Serial.printf("✅ Sent %d samples in %d chunks\n", totalSamples, chunksSent);
 
-    // Read response with timeout (won't hang forever)
-    unsigned long deadline = millis() + 30000;
-    while (client.connected() && millis() < deadline) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r") break;
-    }
+    // Signal server: stop and process
+    webSocket.sendTXT("STOP");
+    waitingForResponse = true;
 
-    String response = "";
-    while (client.available() && millis() < deadline) {
-        response += (char)client.read();
-    }
-    client.stop();
-
-    if (response.length() > 0) {
-        Serial.println("   Response: " + response);
-    } else {
-        Serial.println("   (no response body)");
-    }
-    Serial.printf("   Free heap after: %u bytes\n", ESP.getFreeHeap());
+    Serial.println("⏳ Waiting for server response...");
+    Serial.printf("Free heap after record: %u bytes\n", ESP.getFreeHeap());
 }
 
 // ==========================================
@@ -233,61 +182,35 @@ void recordAndSend() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== Memonic Bracelet ===");
+
+    Serial.println("\n============================");
+    Serial.println("  Memonic Bracelet (WebSocket)");
+    Serial.println("============================");
     Serial.printf("Total heap: %u bytes\n", ESP.getHeapSize());
     Serial.printf("Free heap:  %u bytes\n", ESP.getFreeHeap());
 
-    // WiFi stays connected permanently
-    WiFi.setAutoReconnect(true);
-    WiFi.persistent(true);
-    ensureWiFi();
-
+    connectWiFi();
     initI2S();
 
-    Serial.printf("Free heap after init: %u bytes\n", ESP.getFreeHeap());
-    Serial.println("Ready!\n");
+    // Connect WebSocket (WSS — secure)
+    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(5000);  // Auto-reconnect every 5s if dropped
 
-    // First heartbeat immediately
-    if (WiFi.status() == WL_CONNECTED) {
-        sendHeartbeat();
-    }
-    lastHeartbeat = millis();
-    lastRecording = millis();
+    Serial.println("WebSocket connecting...");
+    Serial.printf("Free heap after init: %u bytes\n", ESP.getFreeHeap());
 }
 
 // ==========================================
-// LOOP — non-blocking, always-alive
-//
-// Two independent timers:
-//   1. Heartbeat every 10s  → keeps UI "Connected"
-//   2. Recording every 20s  → sends audio to pipeline
-//
-// If anything fails, we log and move on.
-// The ESP32 never crashes or restarts.
+// LOOP — non-blocking, WebSocket stays alive
 // ==========================================
 void loop() {
-    // Reconnect WiFi if dropped
-    ensureWiFi();
+    // Must call frequently to keep WebSocket alive & handle events
+    webSocket.loop();
 
-    if (WiFi.status() != WL_CONNECTED) {
-        delay(1000);  // wait before retry
-        return;
+    // Record at fixed intervals (only when connected and not waiting for a response)
+    if (wsConnected && !waitingForResponse && (millis() - lastRecordTime > RECORD_INTERVAL_MS)) {
+        recordAndStream();
+        lastRecordTime = millis();
     }
-
-    unsigned long now = millis();
-
-    // ── Heartbeat (lightweight, every 10s) ──
-    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
-        sendHeartbeat();
-        lastHeartbeat = now;
-    }
-
-    // ── Record & send audio (every 20s) ──
-    if (now - lastRecording >= RECORD_INTERVAL_MS) {
-        recordAndSend();
-        lastRecording = now;
-        lastHeartbeat = now;  // audio upload also counts as heartbeat
-    }
-
-    delay(100);  // prevent watchdog reset
 }
