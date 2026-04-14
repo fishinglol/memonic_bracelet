@@ -1,17 +1,16 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <WiFi.h>
-#include <WebSocketsClient.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD
 
 // ==========================================
 // CONFIG
 // ==========================================
-const char* WS_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
-const int   WS_PORT = 443;
-const char* WS_PATH = "/ws/audio";
+const char* SERVER_URL = "https://8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai/api/esp32-audio";
 
-// Audio config (unchanged from original)
+// Audio config
 #define I2S_SCK   5
 #define I2S_WS    4
 #define I2S_SD    6
@@ -20,19 +19,13 @@ const char* WS_PATH = "/ws/audio";
 #define RECORD_SECONDS 5
 #define SAMPLES_TOTAL  (SAMPLE_RATE * RECORD_SECONDS)
 
-// Timing
-#define RECORD_INTERVAL_MS  15000  // Record every 15 seconds
+// Timing & retry
+#define RECORD_INTERVAL_MS  15000
+#define MAX_RETRIES         3
+#define HTTP_TIMEOUT_MS     60000  // 60s — AI processing takes time
 
 // ==========================================
-// STATE
-// ==========================================
-WebSocketsClient webSocket;
-bool wsConnected = false;
-bool waitingForResponse = false;
-unsigned long lastRecordTime = 0;
-
-// ==========================================
-// I2S INIT (same pin config as before)
+// I2S INIT
 // ==========================================
 void initI2S() {
     i2s_config_t cfg = {
@@ -80,100 +73,180 @@ void connectWiFi() {
 }
 
 // ==========================================
-// WEBSOCKET EVENT HANDLER
+// WAV HEADER — 44 bytes for 16-bit mono PCM
 // ==========================================
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-    switch (type) {
-        case WStype_DISCONNECTED:
-            wsConnected = false;
-            Serial.println("🔌 WebSocket disconnected — will auto-reconnect");
-            break;
+void writeWavHeader(uint8_t* buf, uint32_t dataSize, uint32_t sampleRate) {
+    uint32_t fileSize = 36 + dataSize;
+    uint16_t channels = 1;
+    uint16_t bitsPerSample = 16;
+    uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+    uint16_t blockAlign = channels * bitsPerSample / 8;
 
-        case WStype_CONNECTED:
-            wsConnected = true;
-            waitingForResponse = false;
-            Serial.printf("🔌 WebSocket connected to: %s%s\n", WS_HOST, WS_PATH);
-            Serial.printf("   Free heap: %u bytes\n", ESP.getFreeHeap());
-            break;
-
-        case WStype_TEXT:
-            // Server sends JSON result after processing
-            Serial.println("\n📨 Server response:");
-            Serial.println((char*)payload);
-            Serial.println();
-            waitingForResponse = false;
-            break;
-
-        case WStype_ERROR:
-            Serial.printf("❌ WebSocket error (length: %u)\n", length);
-            break;
-
-        default:
-            break;
-    }
+    memcpy(buf + 0,  "RIFF", 4);
+    memcpy(buf + 4,  &fileSize, 4);
+    memcpy(buf + 8,  "WAVE", 4);
+    memcpy(buf + 12, "fmt ", 4);
+    uint32_t subchunk1Size = 16;
+    memcpy(buf + 16, &subchunk1Size, 4);
+    uint16_t audioFormat = 1;
+    memcpy(buf + 20, &audioFormat, 2);
+    memcpy(buf + 22, &channels, 2);
+    memcpy(buf + 24, &sampleRate, 4);
+    memcpy(buf + 28, &byteRate, 4);
+    memcpy(buf + 32, &blockAlign, 2);
+    memcpy(buf + 34, &bitsPerSample, 2);
+    memcpy(buf + 36, "data", 4);
+    memcpy(buf + 40, &dataSize, 4);
 }
 
 // ==========================================
-// RECORD & STREAM via WebSocket
-//
-// Protocol:
-//   1. Send TEXT "START"
-//   2. Send BINARY chunks (raw 16-bit PCM, 16kHz, mono)
-//   3. Send TEXT "STOP"
-//   4. Wait for JSON response
-//
-// RAM usage: ~1KB (256-sample I2S buf + 256-sample conversion buf)
+// RECORD AUDIO INTO BUFFER
 // ==========================================
-void recordAndStream() {
-    if (!wsConnected) {
-        Serial.println("⚠️  Not connected, skipping recording");
-        return;
-    }
-
-    Serial.printf("\nFree heap before record: %u bytes\n", ESP.getFreeHeap());
-
-    // Signal server: start recording
-    webSocket.sendTXT("START");
-    delay(50);  // Let server process the command
-
-    Serial.printf("🎤 Recording %d seconds...\n", RECORD_SECONDS);
-
-    int32_t i2sBuf[256];       // ~1KB — I2S read buffer (32-bit samples)
-    int16_t sampleBuf[256];    // ~512 bytes — converted 16-bit samples
+int recordAudio(int16_t* audioData, int maxSamples) {
+    int32_t i2sBuf[256];
     int totalSamples = 0;
-    int chunksSent = 0;
 
-    while (totalSamples < SAMPLES_TOTAL) {
+    // Print first few raw I2S values for mic debugging
+    bool printedDebug = false;
+
+    while (totalSamples < maxSamples) {
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
         int count = bytesRead / sizeof(int32_t);
 
-        // Limit to remaining samples
-        int remaining = SAMPLES_TOTAL - totalSamples;
+        int remaining = maxSamples - totalSamples;
         if (count > remaining) count = remaining;
 
-        // Convert 32-bit I2S → 16-bit PCM
         for (int i = 0; i < count; i++) {
-            sampleBuf[i] = (int16_t)(i2sBuf[i] >> 16);
+            audioData[totalSamples + i] = (int16_t)(i2sBuf[i] >> 16);
         }
 
-        // Send raw PCM chunk over WebSocket (binary)
-        webSocket.sendBIN((uint8_t*)sampleBuf, count * sizeof(int16_t));
-        totalSamples += count;
-        chunksSent++;
+        // Debug: print first 10 raw I2S values to check mic output
+        if (!printedDebug && totalSamples == 0) {
+            Serial.print("   Raw I2S[0..9]: ");
+            for (int i = 0; i < 10 && i < count; i++) {
+                Serial.printf("%d ", i2sBuf[i]);
+            }
+            Serial.println();
+            Serial.print("   PCM[0..9]:     ");
+            for (int i = 0; i < 10 && i < count; i++) {
+                Serial.printf("%d ", audioData[i]);
+            }
+            Serial.println();
+            printedDebug = true;
+        }
 
-        // Keep WebSocket alive during recording
-        webSocket.loop();
+        totalSamples += count;
     }
 
-    Serial.printf("✅ Sent %d samples in %d chunks\n", totalSamples, chunksSent);
+    // Audio stats
+    int32_t minVal = 32767, maxVal = -32768;
+    int64_t sumSq = 0;
+    for (int i = 0; i < totalSamples; i++) {
+        int16_t s = audioData[i];
+        if (s < minVal) minVal = s;
+        if (s > maxVal) maxVal = s;
+        sumSq += (int64_t)s * s;
+    }
+    float rms = sqrt((float)sumSq / totalSamples);
+    Serial.printf("   Audio stats — Min: %d, Max: %d, RMS: %.1f\n", minVal, maxVal, rms);
 
-    // Signal server: stop and process
-    webSocket.sendTXT("STOP");
-    waitingForResponse = true;
+    if (rms < 10) {
+        Serial.println("   ⚠️  Audio is nearly SILENT! Check mic wiring.");
+    } else if (rms < 100) {
+        Serial.println("   ⚠️  Audio is very quiet. Mic gain may be too low.");
+    } else {
+        Serial.println("   ✅ Audio level looks good!");
+    }
 
-    Serial.println("⏳ Waiting for server response...");
-    Serial.printf("Free heap after record: %u bytes\n", ESP.getFreeHeap());
+    return totalSamples;
+}
+
+// ==========================================
+// SEND AUDIO VIA HTTP POST (with retry)
+// ==========================================
+bool sendAudio(uint8_t* wavBuf, uint32_t wavSize) {
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        Serial.printf("📤 Sending attempt %d/%d (%u bytes)...\n", attempt, MAX_RETRIES, wavSize);
+
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("   WiFi lost — reconnecting...");
+            connectWiFi();
+        }
+
+        WiFiClientSecure client;
+        client.setInsecure();
+
+        HTTPClient http;
+        http.setTimeout(HTTP_TIMEOUT_MS);
+
+        if (!http.begin(client, SERVER_URL)) {
+            Serial.println("   ❌ http.begin() failed");
+            delay(2000);
+            continue;
+        }
+
+        http.addHeader("Content-Type", "application/octet-stream");
+
+        int httpCode = http.POST(wavBuf, wavSize);
+
+        if (httpCode > 0) {
+            String response = http.getString();
+            Serial.printf("   ✅ Server responded (%d):\n", httpCode);
+            Serial.println(response);
+            http.end();
+            return true;
+        } else {
+            Serial.printf("   ❌ HTTP error: %s (code %d)\n",
+                          http.errorToString(httpCode).c_str(), httpCode);
+            http.end();
+
+            if (attempt < MAX_RETRIES) {
+                int waitMs = attempt * 3000;
+                Serial.printf("   Retrying in %d seconds...\n", waitMs / 1000);
+                delay(waitMs);
+            }
+        }
+    }
+
+    Serial.println("   ❌ All retries failed!");
+    return false;
+}
+
+// ==========================================
+// MAIN: RECORD + SEND
+// ==========================================
+void recordAndSend() {
+    Serial.printf("\n════════════════════════════════\n");
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+
+    uint32_t dataSize = SAMPLES_TOTAL * sizeof(int16_t);  // 160000 bytes
+    uint32_t wavSize  = 44 + dataSize;
+
+    // Allocate WAV buffer
+    uint8_t* wavBuf = (uint8_t*)malloc(wavSize);
+    if (!wavBuf) {
+        Serial.printf("❌ Cannot allocate %u bytes! (free: %u)\n", wavSize, ESP.getFreeHeap());
+        return;
+    }
+    Serial.printf("Allocated %u bytes for WAV (free: %u)\n", wavSize, ESP.getFreeHeap());
+
+    // Write WAV header
+    writeWavHeader(wavBuf, dataSize, SAMPLE_RATE);
+
+    // Record audio
+    Serial.printf("🎤 Recording %d seconds...\n", RECORD_SECONDS);
+    int16_t* audioData = (int16_t*)(wavBuf + 44);
+    int samples = recordAudio(audioData, SAMPLES_TOTAL);
+    Serial.printf("   Recorded %d samples\n", samples);
+
+    // Send with retry
+    sendAudio(wavBuf, wavSize);
+
+    // Free buffer
+    free(wavBuf);
+    Serial.printf("Free heap after free: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("════════════════════════════════\n\n");
 }
 
 // ==========================================
@@ -184,7 +257,8 @@ void setup() {
     delay(1000);
 
     Serial.println("\n============================");
-    Serial.println("  Memonic Bracelet (WebSocket)");
+    Serial.println("  Memonic Bracelet v2");
+    Serial.println("  (HTTP POST + Retry)");
     Serial.println("============================");
     Serial.printf("Total heap: %u bytes\n", ESP.getHeapSize());
     Serial.printf("Free heap:  %u bytes\n", ESP.getFreeHeap());
@@ -192,25 +266,18 @@ void setup() {
     connectWiFi();
     initI2S();
 
-    // Connect WebSocket (WSS — secure)
-    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-    webSocket.onEvent(webSocketEvent);
-    webSocket.setReconnectInterval(5000);  // Auto-reconnect every 5s if dropped
-
-    Serial.println("WebSocket connecting...");
     Serial.printf("Free heap after init: %u bytes\n", ESP.getFreeHeap());
+    Serial.println("Ready!\n");
 }
 
 // ==========================================
-// LOOP — non-blocking, WebSocket stays alive
+// LOOP
 // ==========================================
 void loop() {
-    // Must call frequently to keep WebSocket alive & handle events
-    webSocket.loop();
+    static unsigned long lastRecord = 0;
 
-    // Record at fixed intervals (only when connected and not waiting for a response)
-    if (wsConnected && !waitingForResponse && (millis() - lastRecordTime > RECORD_INTERVAL_MS)) {
-        recordAndStream();
-        lastRecordTime = millis();
+    if (millis() - lastRecord > RECORD_INTERVAL_MS) {
+        recordAndSend();
+        lastRecord = millis();
     }
 }
