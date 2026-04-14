@@ -9,6 +9,11 @@
 // CONFIG
 // ==========================================
 const char* SERVER_URL = "https://8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai/api/esp32-audio";
+const char* ENROLL_URL = "https://8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai/api/esp32-enroll/";
+
+// Enrollment config
+#define ENROLL_SECONDS  7
+#define ENROLL_SAMPLES  (SAMPLE_RATE * ENROLL_SECONDS)
 
 // Audio config
 #define I2S_SCK   5
@@ -250,6 +255,79 @@ void recordAndSend() {
 }
 
 // ==========================================
+// ENROLL VOICE via Serial command
+//
+// Type "ENROLL fish" in Serial Monitor
+// Records 7 seconds, sends to /api/esp32-enroll/fish
+// ==========================================
+void enrollVoice(String userId) {
+    userId.trim();
+    if (userId.length() == 0) {
+        Serial.println("❌ Usage: ENROLL <username>");
+        Serial.println("   Example: ENROLL fish");
+        return;
+    }
+
+    Serial.printf("\n════════════════════════════════\n");
+    Serial.printf("🎙️  ENROLLMENT MODE: '%s'\n", userId.c_str());
+    Serial.printf("════════════════════════════════\n");
+    Serial.println("Speak clearly for 7 seconds...");
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+
+    uint32_t dataSize = ENROLL_SAMPLES * sizeof(int16_t);
+    uint32_t wavSize  = 44 + dataSize;
+
+    uint8_t* wavBuf = (uint8_t*)malloc(wavSize);
+    if (!wavBuf) {
+        Serial.printf("❌ Cannot allocate %u bytes!\n", wavSize);
+        return;
+    }
+
+    writeWavHeader(wavBuf, dataSize, SAMPLE_RATE);
+
+    // Countdown
+    Serial.println("Starting in...");
+    for (int i = 3; i > 0; i--) {
+        Serial.printf("  %d...\n", i);
+        delay(1000);
+    }
+    Serial.println("🎤 RECORDING NOW — speak clearly!");
+
+    int16_t* audioData = (int16_t*)(wavBuf + 44);
+    int samples = recordAudio(audioData, ENROLL_SAMPLES);
+    Serial.printf("   Recorded %d samples (%.1fs)\n", samples, (float)samples / SAMPLE_RATE);
+
+    // Build enrollment URL
+    String enrollUrl = String(ENROLL_URL) + userId;
+    Serial.printf("📤 Sending to: %s\n", enrollUrl.c_str());
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    if (http.begin(client, enrollUrl)) {
+        http.addHeader("Content-Type", "application/octet-stream");
+        int httpCode = http.POST(wavBuf, wavSize);
+
+        if (httpCode > 0) {
+            Serial.printf("✅ Server responded (%d):\n", httpCode);
+            Serial.println(http.getString());
+        } else {
+            Serial.printf("❌ HTTP error: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+    } else {
+        Serial.println("❌ Failed to connect");
+    }
+
+    free(wavBuf);
+    Serial.printf("Free heap after: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("════════════════════════════════\n\n");
+}
+
+// ==========================================
 // SETUP
 // ==========================================
 void setup() {
@@ -258,7 +336,10 @@ void setup() {
 
     Serial.println("\n============================");
     Serial.println("  Memonic Bracelet v2");
-    Serial.println("  (HTTP POST + Retry)");
+    Serial.println("============================");
+    Serial.println("Commands (type in Serial Monitor):");
+    Serial.println("  ENROLL <name>  — Record 7s to enroll voice");
+    Serial.println("  (auto-records every 15s otherwise)");
     Serial.println("============================");
     Serial.printf("Total heap: %u bytes\n", ESP.getHeapSize());
     Serial.printf("Free heap:  %u bytes\n", ESP.getFreeHeap());
@@ -271,11 +352,27 @@ void setup() {
 }
 
 // ==========================================
-// LOOP
+// LOOP — checks Serial for commands, auto-records otherwise
 // ==========================================
 void loop() {
     static unsigned long lastRecord = 0;
 
+    // Check for Serial commands
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd.startsWith("ENROLL ") || cmd.startsWith("enroll ")) {
+            String userId = cmd.substring(7);
+            enrollVoice(userId);
+            lastRecord = millis();  // Reset timer after enrollment
+        } else if (cmd.length() > 0) {
+            Serial.printf("Unknown command: '%s'\n", cmd.c_str());
+            Serial.println("Available: ENROLL <name>");
+        }
+    }
+
+    // Auto-record at interval
     if (millis() - lastRecord > RECORD_INTERVAL_MS) {
         recordAndSend();
         lastRecord = millis();
