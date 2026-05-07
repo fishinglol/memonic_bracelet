@@ -1,247 +1,232 @@
 #include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <driver/i2s.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD
 
-// ==========================================
-// CONFIG
-// ==========================================
-const char* SERVER_HOST = "8001-01kkh2et3bdjymj2fjq6jabg8k.cloudspaces.litng.ai";
-const int   SERVER_PORT = 443;
-const char* AUDIO_PATH  = "/api/esp32-audio";
-const char* ENROLL_PATH = "/api/esp32-enroll/";
+// --- BLE UUIDs ---
+#define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
+#define CHARACTERISTIC_UUID "abcd1234-ab12-ab12-ab12-abcdef123456"
 
-// Audio
-#define I2S_SCK   5
-#define I2S_WS    4
-#define I2S_SD    6
-#define I2S_PORT  I2S_NUM_0
-#define SAMPLE_RATE    16000
-#define RECORD_SECONDS 5
-#define ENROLL_SECONDS 7
+// --- INMP441 Pins (LOLIN S3 Mini) ---
+#define I2S_SCK  5
+#define I2S_WS   4
+#define I2S_SD   6
+#define I2S_PORT I2S_NUM_0
 
-// Timing
-#define RECORD_INTERVAL_MS  15000
+// --- Button ---
+#define BUTTON_PIN 0  // เปลี่ยนตาม pin จริง
 
-// ==========================================
-// I2S INIT
-// ==========================================
+// --- Audio Config ---
+#define SAMPLE_RATE          16000
+#define AUTO_RECORD_SECONDS  5
+#define ENROLL_RECORD_SECONDS 7
+#define BLE_CHUNK_SIZE       512
+
+const int auto_total_samples   = SAMPLE_RATE * AUTO_RECORD_SECONDS;
+const int enroll_total_samples = SAMPLE_RATE * ENROLL_RECORD_SECONDS;
+
+int16_t* audio_buffer  = NULL;
+int      buffer_size   = 0; // จะ set ตาม mode
+
+BLECharacteristic* pCharacteristic = NULL;
+BLEServer*         pServer         = NULL;
+bool deviceConnected = false;
+bool isRecording     = false;
+
+// --- BLE Callbacks ---
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("✅ Phone connected via BLE");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("🔴 Phone disconnected — re-advertising...");
+    BLEDevice::startAdvertising();
+  }
+};
+
+// --- I2S Init ---
 void initI2S() {
-    i2s_config_t cfg = {
-        .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate          = SAMPLE_RATE,
-        .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = 8,
-        .dma_buf_len          = 256,
-        .use_apll             = false,
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = I2S_SCK,
-        .ws_io_num    = I2S_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num  = I2S_SD,
-    };
-    i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
-    i2s_set_pin(I2S_PORT, &pins);
-    i2s_start(I2S_PORT);
+  i2s_config_t cfg = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 8,
+    .dma_buf_len          = 256,
+    .use_apll             = false,
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num   = I2S_SCK,
+    .ws_io_num    = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_SD,
+  };
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pins);
+  i2s_start(I2S_PORT);
 }
 
-// ==========================================
-// WIFI
-// ==========================================
-void connectWiFi() {
-    Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
+// --- Record + Send via BLE ---
+// mode: "START" = auto record | "ENROLL <name>" = enroll
+void recordAndSend(int total_samples, String startMarker) {
+  if (isRecording) return;
+  isRecording = true;
+
+  Serial.printf("\n[1] Mode: %s | Recording %d samples...\n",
+                startMarker.c_str(), total_samples);
+  i2s_zero_dma_buffer((i2s_port_t)I2S_PORT);
+
+  // reallocate buffer if needed
+  if (buffer_size < total_samples) {
+    free(audio_buffer);
+    audio_buffer = (int16_t*)malloc(total_samples * sizeof(int16_t));
+    if (!audio_buffer) {
+      Serial.println("❌ RAM allocation failed!");
+      isRecording = false;
+      return;
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("\nWiFi FAILED — restarting...");
-        ESP.restart();
+    buffer_size = total_samples;
+  }
+
+  // อัดเสียง
+  int     samples_read = 0;
+  int32_t i2s_chunk[256];
+  size_t  bytesIn;
+
+  while (samples_read < total_samples) {
+    i2s_read(I2S_PORT, &i2s_chunk, sizeof(i2s_chunk), &bytesIn, portMAX_DELAY);
+    int valid = bytesIn / 4;
+    for (int i = 0; i < valid && samples_read < total_samples; i++) {
+      audio_buffer[samples_read++] = (int16_t)(i2s_chunk[i] >> 16); // ✅ correct shift for INMP441
     }
+  }
+
+  // debug peak
+  int32_t peak = 0;
+  for (int i = 0; i < total_samples; i++) {
+    if (abs(audio_buffer[i]) > peak) peak = abs(audio_buffer[i]);
+  }
+  Serial.printf("[2] Recorded %d samples | peak: %d\n", total_samples, peak);
+
+  if (!deviceConnected) {
+    Serial.println("⚠️ No phone — recorded but not sent");
+    isRecording = false;
+    return;
+  }
+
+  // ส่ง START marker (บอก phone ว่าเป็น mode อะไร)
+  pCharacteristic->setValue(startMarker.c_str());
+  pCharacteristic->notify();
+  delay(50);
+
+  // ส่ง PCM chunks
+  const size_t total_bytes = total_samples * sizeof(int16_t);
+  size_t offset = 0;
+  int chunk_count = 0;
+
+  Serial.println("[3] Sending via BLE...");
+  while (offset < total_bytes) {
+    if (!deviceConnected) {
+      Serial.println("❌ Disconnected mid-send!");
+      isRecording = false;
+      return;
+    }
+    size_t to_send = min((size_t)BLE_CHUNK_SIZE, total_bytes - offset);
+    pCharacteristic->setValue((uint8_t*)audio_buffer + offset, to_send);
+    pCharacteristic->notify();
+    offset += to_send;
+    chunk_count++;
+    delay(20);
+  }
+
+  // ส่ง END marker
+  pCharacteristic->setValue((uint8_t*)"END", 3);
+  pCharacteristic->notify();
+
+  Serial.printf("[4] ✅ Done! %d chunks (%d bytes) + END\n", chunk_count, total_bytes);
+  isRecording = false;
 }
 
-// ==========================================
-// WAV HEADER
-// ==========================================
-void writeWavHeader(uint8_t* buf, uint32_t dataSize) {
-    uint32_t byteRate = SAMPLE_RATE * 1 * 16 / 8;
-    uint32_t fileSize = 36 + dataSize;
-    
-    memcpy(buf + 0, "RIFF", 4);
-    memcpy(buf + 4, &fileSize, 4);
-    memcpy(buf + 8, "WAVE", 4);
-    memcpy(buf + 12, "fmt ", 4);
-    uint32_t subchunk1Size = 16;
-    memcpy(buf + 16, &subchunk1Size, 4);
-    uint16_t audioFormat = 1;
-    memcpy(buf + 20, &audioFormat, 2);
-    uint16_t channels = 1;
-    memcpy(buf + 22, &channels, 2);
-    uint32_t sr = SAMPLE_RATE;
-    memcpy(buf + 24, &sr, 4);
-    memcpy(buf + 28, &byteRate, 4);
-    uint16_t blockAlign = 2;
-    memcpy(buf + 32, &blockAlign, 2);
-    uint16_t bps = 16;
-    memcpy(buf + 34, &bps, 2);
-    memcpy(buf + 36, "data", 4);
-    memcpy(buf + 40, &dataSize, 4);
-}
-
-// ==========================================
-// STREAM AUDIO ON THE FLY (NO MALLOC!)
-// Records directly into HTTPS socket chunk by chunk
-// ==========================================
-void recordAndStreamAudio(const char* urlPath, int durationSecs) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi lost, reconnecting...");
-        connectWiFi();
-    }
-
-    uint32_t totalSamples = SAMPLE_RATE * durationSecs;
-    uint32_t dataSize = totalSamples * sizeof(int16_t);
-    uint32_t contentLen = 44 + dataSize;
-
-    Serial.printf("\n════════════════════════════════\n");
-    Serial.printf("🎤 Streaming %d seconds to %s...\n", durationSecs, urlPath);
-    Serial.printf("   Free heap: %u bytes\n", ESP.getFreeHeap());
-
-    WiFiClientSecure client;
-    client.setInsecure(); // Skip SSL cert check
-    client.setTimeout(60);
-
-    Serial.print("   Connecting to server... ");
-    if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-        Serial.println("❌ FAILED!");
-        return;
-    }
-    Serial.println("OK!");
-
-    // Send HTTP POST headers
-    client.printf("POST %s HTTP/1.1\r\n", urlPath);
-    client.printf("Host: %s\r\n", SERVER_HOST);
-    client.printf("Content-Type: application/octet-stream\r\n");
-    client.printf("Content-Length: %u\r\n", contentLen);
-    client.printf("Connection: close\r\n\r\n");
-
-    // Send WAV Header (44 bytes)
-    uint8_t header[44];
-    writeWavHeader(header, dataSize);
-    client.write(header, 44);
-
-    // Stream audio on-the-fly
-    int32_t i2sBuf[256];
-    int16_t sampleBuf[256];
-    uint32_t samplesSent = 0;
-
-    while (samplesSent < totalSamples) {
-        size_t bytesRead = 0;
-        i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
-        int count = bytesRead / sizeof(int32_t);
-
-        int remaining = totalSamples - samplesSent;
-        if (count > remaining) count = remaining;
-
-        // Convert 32-bit I2S to 16-bit PCM
-        for (int i = 0; i < count; i++) {
-            sampleBuf[i] = (int16_t)(i2sBuf[i] >> 16);
-        }
-
-        client.write((const uint8_t*)sampleBuf, count * sizeof(int16_t));
-        samplesSent += count;
-    }
-
-    Serial.println("   ✅ Audio stream finished. Waiting for result...");
-
-    // Read response line (e.g., HTTP/1.1 200 OK)
-    String responseLine = client.readStringUntil('\n');
-    responseLine.trim();
-    
-    // Skip remaining headers
-    while (client.connected()) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r" || line == "") break; 
-    }
-
-    // Read full body JSON
-    String responseBody = "";
-    while (client.connected() || client.available()) {
-        if (client.available()) {
-            responseBody += (char)client.read();
-        }
-    }
-    client.stop();
-
-    if (responseLine.indexOf("200 OK") != -1) {
-        Serial.println("   🎉 SUCCESS!");
-        Serial.println(responseBody);
-    } else {
-        Serial.printf("   ❌ ERROR: %s\n", responseLine.c_str());
-        Serial.println(responseBody);
-    }
-    Serial.printf("════════════════════════════════\n\n");
-}
-
-// ==========================================
-// SETUP
-// ==========================================
+// --- Setup ---
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.begin(115200);
+  delay(1000);
 
-    Serial.println("\n============================");
-    Serial.println("  Memonic Bracelet (Streaming)");
-    Serial.println("============================");
-    Serial.println("Commands (type in Serial Monitor):");
-    Serial.println("  ENROLL <name>  — Record a voice profile");
-    Serial.println("============================");
+  Serial.println("============================");
+  Serial.println("  Memonic Bracelet (BLE)");
+  Serial.println("============================");
+  Serial.println("Commands (Serial Monitor):");
+  Serial.println("  ENROLL <name>  — Record voice profile");
+  Serial.println("  Button         — Auto record 5s");
+  Serial.println("============================");
 
-    connectWiFi();
-    initI2S();
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    Serial.println("\n✅ Boot Complete! Ready to stream.\n");
+  // จอง RAM สำหรับ buffer ใหญ่สุด (enroll = 7s)
+  audio_buffer = (int16_t*)malloc(enroll_total_samples * sizeof(int16_t));
+  if (!audio_buffer) {
+    Serial.println("❌ RAM allocation failed!");
+    while (true) delay(1000);
+  }
+  buffer_size = enroll_total_samples;
+  Serial.printf("✅ RAM OK: %d bytes\n", enroll_total_samples * (int)sizeof(int16_t));
+
+  initI2S();
+  Serial.println("✅ I2S ready");
+
+  // BLE init
+  BLEDevice::init("Memonic");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ  |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  Serial.println("✅ BLE advertising as 'Memonic'");
+  Serial.println("⏳ Waiting for button or Serial command...");
 }
 
-// ==========================================
-// LOOP
-// ==========================================
+// --- Loop ---
 void loop() {
-    static unsigned long lastRecord = 0;
-
-    // Check for Serial commands for Enrollment mode
-    if (Serial.available()) {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-
-        if (cmd.startsWith("ENROLL ") || cmd.startsWith("enroll ")) {
-            String userId = cmd.substring(7);
-            userId.trim();
-
-            Serial.printf("\n🎙️ ENROLLMENT MODE: '%s'\n", userId.c_str());
-            Serial.println("Starting in 3..."); delay(1000);
-            Serial.println("2..."); delay(1000);
-            Serial.println("1..."); delay(1000);
-            
-            String enrollPathStr = String(ENROLL_PATH) + userId;
-            recordAndStreamAudio(enrollPathStr.c_str(), ENROLL_SECONDS);
-            
-            lastRecord = millis(); // restart auto-record timer
-        }
+  // Serial command → ENROLL mode
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("ENROLL ") || cmd.startsWith("enroll ")) {
+      String name = cmd.substring(7);
+      name.trim();
+      Serial.printf("🎙️ ENROLL: '%s'\n", name.c_str());
+      Serial.println("3..."); delay(1000);
+      Serial.println("2..."); delay(1000);
+      Serial.println("1..."); delay(1000);
+      recordAndSend(enroll_total_samples, "ENROLL " + name);
     }
+  }
 
-    // Auto-record every 15 seconds
-    if (millis() - lastRecord > RECORD_INTERVAL_MS) {
-        recordAndStreamAudio(AUDIO_PATH, RECORD_SECONDS);
-        lastRecord = millis();
+  // Button → AUTO record
+  if (digitalRead(BUTTON_PIN) == LOW && !isRecording) {
+    delay(50); // debounce
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      recordAndSend(auto_total_samples, "START");
     }
+  }
+
+  delay(10);
 }
