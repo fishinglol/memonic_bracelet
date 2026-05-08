@@ -34,6 +34,7 @@ BLECharacteristic* pCharacteristic = NULL;
 BLEServer*         pServer         = NULL;
 bool deviceConnected = false;
 bool isRecording     = false;
+bool autoRecordEnabled = true;
 
 // --- Forward Declaration ---
 void recordAndSend(int total_samples, String startMarker);
@@ -65,6 +66,24 @@ class MyCallbacks : public BLECharacteristicCallbacks {
         Serial.printf("🎙️ BLE ENROLL trigger: '%s'\n", name.c_str());
         // Record 7 seconds for enrollment
         recordAndSend(enroll_total_samples, "ENROLL " + name);
+      }
+      
+      if (cmd.equals("RESET")) {
+        Serial.println("🛑 BLE RESET trigger: Aborting recording...");
+        isRecording = false;
+        autoRecordEnabled = true; // Re-enable on reset
+        pCharacteristic->setValue("RESET");
+        pCharacteristic->notify();
+      }
+
+      if (cmd.equals("DISABLE_AUTO")) {
+        Serial.println("🔒 Auto-record DISABLED (Enrollment mode)");
+        autoRecordEnabled = false;
+      }
+
+      if (cmd.equals("ENABLE_AUTO")) {
+        Serial.println("🔓 Auto-record ENABLED (Normal mode)");
+        autoRecordEnabled = true;
       }
     }
   }
@@ -244,8 +263,8 @@ void loop() {
     }
   }
 
-  // Button → AUTO record
-  if (digitalRead(BUTTON_PIN) == LOW && !isRecording) {
+  // Button → AUTO record (Only if enabled)
+  if (digitalRead(BUTTON_PIN) == LOW && !isRecording && autoRecordEnabled) {
     delay(50); // debounce
     if (digitalRead(BUTTON_PIN) == LOW) {
       recordAndSend(auto_total_samples, "START");
