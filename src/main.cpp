@@ -35,6 +35,9 @@ BLEServer*         pServer         = NULL;
 bool deviceConnected = false;
 bool isRecording     = false;
 
+// --- Forward Declaration ---
+void recordAndSend(int total_samples, String startMarker);
+
 // --- BLE Callbacks ---
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -45,6 +48,25 @@ class ServerCallbacks : public BLEServerCallbacks {
     deviceConnected = false;
     Serial.println("🔴 Phone disconnected — re-advertising...");
     BLEDevice::startAdvertising();
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue().c_str();
+    if (value.length() > 0) {
+      String cmd = value;
+      cmd.trim();
+      Serial.printf("📥 BLE Command: %s\n", cmd.c_str());
+
+      if (cmd.startsWith("ENROLL ") || cmd.startsWith("enroll ")) {
+        String name = cmd.substring(7);
+        name.trim();
+        Serial.printf("🎙️ BLE ENROLL trigger: '%s'\n", name.c_str());
+        // Record 7 seconds for enrollment
+        recordAndSend(enroll_total_samples, "ENROLL " + name);
+      }
+    }
   }
 };
 
@@ -189,8 +211,10 @@ void setup() {
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ  |
+    BLECharacteristic::PROPERTY_WRITE |
     BLECharacteristic::PROPERTY_NOTIFY
   );
+  pCharacteristic->setCallbacks(new MyCallbacks());
   pCharacteristic->addDescriptor(new BLE2902());
   pService->start();
 
