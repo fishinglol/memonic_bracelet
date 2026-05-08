@@ -30,14 +30,6 @@ const int enroll_total_samples = SAMPLE_RATE * ENROLL_RECORD_SECONDS;
 int16_t* audio_buffer  = NULL;
 int      buffer_size   = 0; // จะ set ตาม mode
 
-// --- Auto Record Interval ---
-#define RECORD_INTERVAL_MS (15 * 1000) // 15 seconds
-unsigned long lastRecordTime = 0;
-32: 
-33: // --- Auto Record Interval ---
-34: #define RECORD_INTERVAL_MS (15 * 1000) // 15 seconds
-35: unsigned long lastRecordTime = 0;
-
 BLECharacteristic* pCharacteristic = NULL;
 BLEServer*         pServer         = NULL;
 bool deviceConnected = false;
@@ -111,24 +103,16 @@ void recordAndSend(int total_samples, String startMarker) {
     i2s_read(I2S_PORT, &i2s_chunk, sizeof(i2s_chunk), &bytesIn, portMAX_DELAY);
     int valid = bytesIn / 4;
     for (int i = 0; i < valid && samples_read < total_samples; i++) {
-      audio_buffer[samples_read++] = (int16_t)(i2s_chunk[i] >> 16); // ✅ correct shift for INMP441
+      audio_buffer[samples_read++] = (int16_t)(i2s_chunk[i] >> 8); // ✅ correct shift
     }
   }
 
-  // debug peak & RMS
+  // debug peak
   int32_t peak = 0;
-  int64_t sumSq = 0;
   for (int i = 0; i < total_samples; i++) {
-    int16_t s = audio_buffer[i];
-    if (abs(s) > peak) peak = abs(s);
-    sumSq += (int64_t)s * s;
+    if (abs(audio_buffer[i]) > peak) peak = abs(audio_buffer[i]);
   }
-  float rms = sqrt((float)sumSq / total_samples);
-
-  Serial.printf("[2] Recorded %d samples | peak: %d | RMS: %.1f\n", total_samples, peak, rms);
-  if (rms < 100) {
-    Serial.println("   ⚠️ Warning: Audio level is very low!");
-  }
+  Serial.printf("[2] Recorded %d samples | peak: %d\n", total_samples, peak);
 
   if (!deviceConnected) {
     Serial.println("⚠️ No phone — recorded but not sent");
@@ -241,14 +225,7 @@ void loop() {
     delay(50); // debounce
     if (digitalRead(BUTTON_PIN) == LOW) {
       recordAndSend(auto_total_samples, "START");
-      lastRecordTime = millis();
     }
-  }
-
-  // Auto-record every 15 seconds
-  if (deviceConnected && !isRecording && (millis() - lastRecordTime > RECORD_INTERVAL_MS)) {
-    recordAndSend(auto_total_samples, "START");
-    lastRecordTime = millis();
   }
 
   delay(10);
