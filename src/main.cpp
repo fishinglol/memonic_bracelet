@@ -7,6 +7,14 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+// ============================================================
+//  Memonic — ESP32-S3 Super Mini (No PSRAM)
+//  Strategy: dynamic malloc/free per recording session
+//  RAM budget (idle ~200KB free):
+//    AUTO   2s = 64KB → ผ่านสบาย (~110KB เหลือหลัง malloc)
+//    ENROLL 3s = 96KB → fallback เหลือ 2s ถ้า heap ตึง
+// ============================================================
+
 // --- WiFi Config ---
 const char* ssid       = "Fais";
 const char* password   = "12345678";
@@ -27,25 +35,37 @@ const String serverPath = "/audio";
 // --- Audio Config ---
 #define SAMPLE_RATE            16000
 
-// ✅ ลด AUTO เหลือ 2s (64KB) เพราะไม่ต้องการ accuracy สูงเท่า enroll
-// ENROLL คง 3s (96KB) เพราะต้องการ voice profile ที่แม่นยำ
+// AUTO  2s = 32,000 samples = 64KB  ← ปลอดภัย
+// ENROLL 3s = 48,000 samples = 96KB ← พยายามก่อน, fallback เหลือ 2s ถ้า RAM ตึง
 #define AUTO_RECORD_SECONDS    2
 #define ENROLL_RECORD_SECONDS  3
+#define FALLBACK_RECORD_SECONDS 2   // ใช้เมื่อ heap ไม่พอสำหรับ ENROLL 3s
 
-const int auto_total_samples   = SAMPLE_RATE * AUTO_RECORD_SECONDS;   // 32,000 → 64KB
-const int enroll_total_samples = SAMPLE_RATE * ENROLL_RECORD_SECONDS; // 48,000 → 96KB
+const int auto_total_samples    = SAMPLE_RATE * AUTO_RECORD_SECONDS;
+const int enroll_total_samples  = SAMPLE_RATE * ENROLL_RECORD_SECONDS;
+const int fallback_total_samples = SAMPLE_RATE * FALLBACK_RECORD_SECONDS;
 
-// ✅ ไม่มี global audio_buffer อีกต่อไป
-// malloc เฉพาะช่วงอัดเสียง → free ทันทีหลังส่ง
-// ช่วง idle: RAM ว่างให้ WiFi/BLE ใช้งานเต็มที่
+// DMA: 4 × 64 × 4 bytes = 1,024 bytes internal RAM
+// (เดิม 8 × 256 × 4 = 8,192 bytes → ประหยัด ~7KB)
+#define DMA_BUF_COUNT 4
+#define DMA_BUF_LEN   64
 
+// Heartbeat interval
+#define HEARTBEAT_INTERVAL_MS 30000UL
+
+// --- Globals ---
 BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool isRecording     = false;
 
+// --- Forward Declarations ---
 void recordAndSend(int total_samples, String mode, String enrollUser = "");
+void sendHeartbeat();
+void notifyBLE(const char* msg);
 
-// --- BLE Callbacks ---
+// ============================================================
+//  BLE Callbacks
+// ============================================================
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
@@ -54,34 +74,47 @@ class ServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
         BLEDevice::startAdvertising();
-        Serial.println("📱 BLE Client Disconnected, restarting advertising");
+        Serial.println("📱 BLE Client Disconnected — restarting advertising");
     }
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* pCharacteristic) {
-        String value = pCharacteristic->getValue().c_str();
-        if (value.length() > 0) {
-            String cmd = value;
-            cmd.trim();
-            Serial.printf("📥 BLE Command: %s\n", cmd.c_str());
+    void onWrite(BLECharacteristic* pChar) {
+        String value = pChar->getValue().c_str();
+        if (value.length() == 0) return;
 
-            if (cmd.startsWith("ENROLL ")) {
-                String name = cmd.substring(7);
-                name.trim();
-                recordAndSend(enroll_total_samples, "ENROLL", name);
-            } else if (cmd.equals("START")) {
-                recordAndSend(auto_total_samples, "START");
-            } else if (cmd.equals("RESET")) {
-                isRecording = false;
-            }
+        String cmd = value;
+        cmd.trim();
+        Serial.printf("📥 BLE Command: %s\n", cmd.c_str());
+
+        if (cmd.startsWith("ENROLL ")) {
+            String name = cmd.substring(7);
+            name.trim();
+            recordAndSend(enroll_total_samples, "ENROLL", name);
+        } else if (cmd.equals("START")) {
+            recordAndSend(auto_total_samples, "START");
+        } else if (cmd.equals("RESET")) {
+            isRecording = false;
+            Serial.println("🔄 RESET received");
         }
     }
 };
 
-// --- Init ---
+// ============================================================
+//  Helpers
+// ============================================================
+void notifyBLE(const char* msg) {
+    if (pCharacteristic) {
+        pCharacteristic->setValue(msg);
+        pCharacteristic->notify();
+    }
+}
+
+// ============================================================
+//  Init
+// ============================================================
 void initWiFi() {
-    Serial.print("Connecting to WiFi");
+    Serial.print("📶 Connecting to WiFi");
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
@@ -98,10 +131,8 @@ void initI2S() {
         .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        // ✅ ลด DMA: 4 × 64 × 4 bytes = 1,024 bytes (เดิม 8 × 256 × 4 = 8,192 bytes)
-        // ประหยัด ~7KB internal RAM ไม่กระทบเสียงเพราะ recording loop อ่านเร็วกว่า I2S เติม
-        .dma_buf_count        = 4,
-        .dma_buf_len          = 64,
+        .dma_buf_count        = DMA_BUF_COUNT,
+        .dma_buf_len          = DMA_BUF_LEN,
         .use_apll             = false,
     };
     i2s_pin_config_t pins = {
@@ -116,58 +147,100 @@ void initI2S() {
     Serial.println("✅ I2S Initialized");
 }
 
-void writeWavHeader(byte* header, int dataLength) {
-    unsigned int sampleRate = SAMPLE_RATE;
-    unsigned int byteRate   = SAMPLE_RATE * 2;
-    unsigned int fileSize   = 36 + dataLength;
+// ============================================================
+//  WAV Header
+// ============================================================
+void writeWavHeader(byte* h, int dataLength) {
+    unsigned int sr       = SAMPLE_RATE;
+    unsigned int byteRate = SAMPLE_RATE * 2;
+    unsigned int fileSize = 36 + dataLength;
 
-    header[0]='R'; header[1]='I'; header[2]='F'; header[3]='F';
-    header[4]=(byte)(fileSize);         header[5]=(byte)(fileSize>>8);
-    header[6]=(byte)(fileSize>>16);     header[7]=(byte)(fileSize>>24);
-    header[8]='W'; header[9]='A'; header[10]='V'; header[11]='E';
-    header[12]='f'; header[13]='m'; header[14]='t'; header[15]=' ';
-    header[16]=16; header[17]=0; header[18]=0; header[19]=0;
-    header[20]=1;  header[21]=0;
-    header[22]=1;  header[23]=0;
-    header[24]=(byte)(sampleRate);      header[25]=(byte)(sampleRate>>8);
-    header[26]=(byte)(sampleRate>>16);  header[27]=(byte)(sampleRate>>24);
-    header[28]=(byte)(byteRate);        header[29]=(byte)(byteRate>>8);
-    header[30]=(byte)(byteRate>>16);    header[31]=(byte)(byteRate>>24);
-    header[32]=2; header[33]=0;
-    header[34]=16; header[35]=0;
-    header[36]='d'; header[37]='a'; header[38]='t'; header[39]='a';
-    header[40]=(byte)(dataLength);      header[41]=(byte)(dataLength>>8);
-    header[42]=(byte)(dataLength>>16);  header[43]=(byte)(dataLength>>24);
+    // RIFF
+    h[0]='R'; h[1]='I'; h[2]='F'; h[3]='F';
+    h[4]=(byte)(fileSize);      h[5]=(byte)(fileSize>>8);
+    h[6]=(byte)(fileSize>>16);  h[7]=(byte)(fileSize>>24);
+    h[8]='W'; h[9]='A'; h[10]='V'; h[11]='E';
+    // fmt
+    h[12]='f'; h[13]='m'; h[14]='t'; h[15]=' ';
+    h[16]=16; h[17]=0; h[18]=0; h[19]=0;   // chunk size
+    h[20]=1;  h[21]=0;                      // PCM
+    h[22]=1;  h[23]=0;                      // mono
+    h[24]=(byte)(sr);      h[25]=(byte)(sr>>8);
+    h[26]=(byte)(sr>>16);  h[27]=(byte)(sr>>24);
+    h[28]=(byte)(byteRate);      h[29]=(byte)(byteRate>>8);
+    h[30]=(byte)(byteRate>>16);  h[31]=(byte)(byteRate>>24);
+    h[32]=2;  h[33]=0;          // block align
+    h[34]=16; h[35]=0;          // bits per sample
+    // data
+    h[36]='d'; h[37]='a'; h[38]='t'; h[39]='a';
+    h[40]=(byte)(dataLength);      h[41]=(byte)(dataLength>>8);
+    h[42]=(byte)(dataLength>>16);  h[43]=(byte)(dataLength>>24);
 }
 
+// ============================================================
+//  Core: Record → Send
+// ============================================================
 void recordAndSend(int total_samples, String mode, String enrollUser) {
     if (isRecording) return;
     isRecording = true;
 
+    // ----------------------------------------------------------
+    // STEP 1: Smart malloc with fallback
+    // ----------------------------------------------------------
     int needed_bytes = total_samples * sizeof(int16_t);
-    Serial.printf("🧠 Free heap before alloc: %d bytes\n", ESP.getFreeHeap());
-    Serial.printf("📦 Requesting %d bytes for audio buffer...\n", needed_bytes);
 
-    // ✅ Allocate เฉพาะตอนจะใช้งาน ไม่จองทิ้งไว้ตลอด
-    int16_t* audio_buffer = (int16_t*)malloc(needed_bytes);
+    // heap_caps_get_largest_free_block = block จริงที่ contiguous ที่สุด
+    // ต่างจาก getFreeHeap() ที่นับรวม fragmented blocks
+    size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
-    if (!audio_buffer) {
-        Serial.println("❌ malloc failed — not enough RAM");
-        Serial.printf("   Free heap: %d bytes, Needed: %d bytes\n", ESP.getFreeHeap(), needed_bytes);
-        isRecording = false;
-        if (pCharacteristic) {
-            pCharacteristic->setValue("ERROR_RAM");
-            pCharacteristic->notify();
+    Serial.println("─────────────────────────────────");
+    Serial.printf("🧠 Free heap    : %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("🧠 Largest block: %d bytes\n", largest_block);
+    Serial.printf("📦 Need         : %d bytes (%ds)\n",
+                  needed_bytes, total_samples / SAMPLE_RATE);
+
+    // ถ้า block ใหญ่สุดไม่พอ → ลองลดเป็น 2s (fallback)
+    if (largest_block < (size_t)needed_bytes) {
+        if (mode == "ENROLL") {
+            int fallback_bytes = fallback_total_samples * sizeof(int16_t);
+            if (largest_block >= (size_t)fallback_bytes) {
+                Serial.printf("⚠️  RAM tight — ENROLL falling back %ds → %ds\n",
+                              ENROLL_RECORD_SECONDS, FALLBACK_RECORD_SECONDS);
+                total_samples = fallback_total_samples;
+                needed_bytes  = fallback_bytes;
+            } else {
+                Serial.println("❌ Not enough RAM even for 2s — aborting");
+                isRecording = false;
+                notifyBLE("ERROR_RAM");
+                return;
+            }
+        } else {
+            Serial.println("❌ Not enough RAM for AUTO record — aborting");
+            isRecording = false;
+            notifyBLE("ERROR_RAM");
+            return;
         }
+    }
+
+    int16_t* audio_buffer = (int16_t*)malloc(needed_bytes);
+    if (!audio_buffer) {
+        // malloc ล้มเหลวทั้งที่ block ดูพอ → heap fragmented หนัก
+        Serial.println("❌ malloc failed (fragmentation) — aborting");
+        isRecording = false;
+        notifyBLE("ERROR_RAM");
         return;
     }
-    Serial.printf("✅ Buffer allocated | Free heap remaining: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("✅ Buffer allocated %d bytes | Remaining: %d bytes\n",
+                  needed_bytes, ESP.getFreeHeap());
 
-    // --- RECORD: อัดเสียงลง buffer ก่อน (ไม่มี network interrupt เสียงไม่กระตุก) ---
-    Serial.printf("🎙️ Recording %ds (%d samples)...\n",
+    // ----------------------------------------------------------
+    // STEP 2: Record — I2S อ่านลง buffer ล้วนๆ ไม่มี network เลย
+    // เสียงไม่กระตุกแน่นอนเพราะไม่มี interrupt จาก WiFi/TLS
+    // ----------------------------------------------------------
+    Serial.printf("🎙️  Recording %ds (%d samples)...\n",
                   total_samples / SAMPLE_RATE, total_samples);
 
-    int32_t i2s_chunk[64]; // match dma_buf_len
+    int32_t i2s_chunk[DMA_BUF_LEN]; // 64 × 4 = 256 bytes บน stack
     size_t  bytesIn;
     int     samples_read = 0;
 
@@ -175,46 +248,57 @@ void recordAndSend(int total_samples, String mode, String enrollUser) {
         i2s_read(I2S_PORT, i2s_chunk, sizeof(i2s_chunk), &bytesIn, portMAX_DELAY);
         int valid = bytesIn / 4;
         for (int i = 0; i < valid && samples_read < total_samples; i++) {
-            int32_t val = (i2s_chunk[i] >> 8) * 8; // Gain x8
+            // INMP441: 32-bit left-justified → shift >> 8, gain x8
+            int32_t val = (i2s_chunk[i] >> 8) * 8;
             audio_buffer[samples_read++] = (int16_t)constrain(val, -32768, 32767);
         }
     }
     Serial.printf("✅ Recorded %d samples\n", samples_read);
 
-    // --- SEND: ส่งหลังอัดเสร็จ (record first, send later) ---
+    // ถูก RESET ระหว่างอัด
     if (!isRecording) {
-        // ถูก RESET ระหว่างอัด
-        Serial.println("⚠️ Recording cancelled by RESET");
+        Serial.println("⚠️  Recording cancelled by RESET");
         free(audio_buffer);
-        isRecording = false;
         return;
     }
 
+    // ----------------------------------------------------------
+    // STEP 3: WiFi check
+    // ----------------------------------------------------------
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("❌ WiFi Disconnected");
+        Serial.println("❌ WiFi disconnected");
         free(audio_buffer);
         isRecording = false;
-        if (pCharacteristic) { pCharacteristic->setValue("ERROR_WIFI"); pCharacteristic->notify(); }
+        notifyBLE("ERROR_WIFI");
         return;
     }
 
-    Serial.println("☁️ Connecting to server...");
+    // ----------------------------------------------------------
+    // STEP 4: TLS connect
+    // setBufferSizes(rx, tx): ลด mbedTLS buffer จาก default ~32KB → ~1.5KB
+    // ประหยัด ~30KB ช่วง TLS handshake ซึ่งสำคัญมากตอนที่ audio_buffer กิน 96KB อยู่
+    // ----------------------------------------------------------
+    Serial.println("☁️  Connecting to server...");
     WiFiClientSecure client;
     client.setInsecure();
-    // ✅ Optimize SSL buffers to fit in remaining RAM (96KB used by audio)
+    
+    // ✅ บังคับใช้ Buffer ขนาดเล็ก เพื่อให้ TLS Handshake สำเร็จในแรมที่เหลือเพียง 12KB
     client.setBufferSizes(1024, 512); 
 
     if (!client.connect(serverHost, serverPort)) {
-        Serial.println("❌ Connection to server failed!");
+        Serial.println("❌ TLS connection failed");
         free(audio_buffer);
         isRecording = false;
-        if (pCharacteristic) { pCharacteristic->setValue("ERROR_SERVER"); pCharacteristic->notify(); }
+        notifyBLE("ERROR_SERVER");
         return;
     }
+    Serial.println("✅ TLS Connected");
 
-    // Build multipart
+    // ----------------------------------------------------------
+    // STEP 5: Build multipart metadata (ไม่ใช้ RAM เพิ่ม เป็นแค่ String)
+    // ----------------------------------------------------------
     String boundary = "----ESP32Boundary";
-    int dataLen     = samples_read * 2; // 16-bit PCM
+    int    dataLen  = samples_read * 2; // int16 = 2 bytes per sample
 
     String head = "--" + boundary + "\r\n"
                   "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
@@ -230,20 +314,23 @@ void recordAndSend(int total_samples, String mode, String enrollUser) {
 
     int totalLen = head.length() + 44 + dataLen + tail.length();
 
-    // HTTP Request Headers
+    // ----------------------------------------------------------
+    // STEP 6: Send HTTP headers
+    // ----------------------------------------------------------
     client.print(String("POST ") + serverPath + " HTTP/1.1\r\n");
     client.print(String("Host: ") + serverHost + "\r\n");
     client.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
     client.print("Content-Length: " + String(totalLen) + "\r\n");
     client.print("Connection: close\r\n\r\n");
 
-    // WAV Header + Audio Data
+    // ----------------------------------------------------------
+    // STEP 7: Send WAV header + audio data in 2KB chunks
+    // ----------------------------------------------------------
     byte wavHeader[44];
     writeWavHeader(wavHeader, dataLen);
     client.print(head);
     client.write(wavHeader, 44);
 
-    // Stream audio in 2KB chunks
     int offset    = 0;
     int chunkSize = 2048;
     while (offset < dataLen) {
@@ -253,66 +340,97 @@ void recordAndSend(int total_samples, String mode, String enrollUser) {
     }
     client.print(tail);
 
-    // ✅ Free ทันทีหลังส่งข้อมูลเสร็จ ไม่ต้องรอ response
-    // ทำให้ RAM ว่างเร็วที่สุด
+    // ----------------------------------------------------------
+    // STEP 8: Free buffer ทันทีหลังส่งข้อมูลครบ ไม่ต้องรอ response
+    // ทำให้ RAM ว่างเร็วที่สุด — คืน 96KB กลับก่อน read response
+    // ----------------------------------------------------------
     free(audio_buffer);
     audio_buffer = nullptr;
-    Serial.printf("🗑️ Buffer freed | Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("🗑️  Buffer freed | Free heap: %d bytes\n", ESP.getFreeHeap());
 
-    // Read Response
+    // ----------------------------------------------------------
+    // STEP 9: Read server response
+    // ----------------------------------------------------------
     Serial.println("⏳ Waiting for server response...");
-    while (client.connected() && !client.available()) { delay(10); }
+    unsigned long timeout = millis();
+    while (client.connected() && !client.available()) {
+        if (millis() - timeout > 10000) {
+            Serial.println("❌ Server response timeout");
+            client.stop();
+            isRecording = false;
+            notifyBLE("ERROR_TIMEOUT");
+            return;
+        }
+        delay(10);
+    }
+
+    // ข้าม HTTP headers
     while (client.connected()) {
         String line = client.readStringUntil('\n');
-        if (line == "\r") break; // end of HTTP headers
+        if (line == "\r") break;
     }
-    String response = client.readString();
-    Serial.printf("✅ Server Response: %s\n", response.c_str());
 
-    if (pCharacteristic) {
-        pCharacteristic->setValue("SUCCESS");
-        pCharacteristic->notify();
-    }
+    String response = client.readString();
+    Serial.printf("✅ Server: %s\n", response.c_str());
 
     client.stop();
+
+    notifyBLE("SUCCESS");
+    Serial.println("─────────────────────────────────");
     isRecording = false;
 }
 
+// ============================================================
+//  Heartbeat — แจ้ง backend ว่า bracelet online
+// ============================================================
 void sendHeartbeat() {
-    if (WiFi.status() == WL_CONNECTED) {
-        WiFiClientSecure client;
-        client.setInsecure();
-        if (client.connect(serverHost, serverPort)) {
-            String body = "{\"bracelet\":\"Connected\",\"dock\":\"Connected\"}";
-            client.print(String("POST /update HTTP/1.1\r\n") +
-                         "Host: " + serverHost + "\r\n" +
-                         "Content-Type: application/json\r\n" +
-                         "Content-Length: " + String(body.length()) + "\r\n" +
-                         "Connection: close\r\n\r\n" +
-                         body);
-            client.stop();
-        }
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(5);
+
+    if (!client.connect(serverHost, serverPort)) return;
+
+    String body = "{\"bracelet\":\"Connected\",\"dock\":\"Connected\"}";
+    client.print(String("POST /update HTTP/1.1\r\n") +
+                 "Host: " + serverHost + "\r\n" +
+                 "Content-Type: application/json\r\n" +
+                 "Content-Length: " + String(body.length()) + "\r\n" +
+                 "Connection: close\r\n\r\n" +
+                 body);
+
+    // รอ response สั้นๆ แล้วปิด
+    unsigned long t = millis();
+    while (client.connected() && !client.available() && millis() - t < 3000) {
+        delay(10);
     }
+    client.stop();
+    Serial.println("💓 Heartbeat sent");
 }
 
+// ============================================================
+//  Setup
+// ============================================================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
     Serial.println("============================");
-    Serial.println("  Memonic — ESP32-S3 Mini");
+    Serial.println("  Memonic — ESP32-S3 Mini  ");
     Serial.println("============================");
-    Serial.printf("🧠 Total heap: %d bytes\n", ESP.getHeapSize());
-    Serial.printf("🧠 Free heap at boot: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("🧠 Total heap   : %d bytes\n", ESP.getHeapSize());
+    Serial.printf("🧠 Free at boot : %d bytes\n", ESP.getFreeHeap());
 
-    // ✅ ไม่ต้อง allocate buffer ที่นี่อีกต่อไป
-
+    // 1. WiFi
     initWiFi();
-    sendHeartbeat(); // First report to cloud
-    Serial.printf("🧠 Free heap after WiFi: %d bytes\n", ESP.getFreeHeap());
-    delay(500);
+    Serial.printf("🧠 Free after WiFi : %d bytes\n", ESP.getFreeHeap());
+    delay(200);
 
-    // BLE Init
+    // First heartbeat
+    sendHeartbeat();
+
+    // 2. BLE
     BLEDevice::init("Memonic");
     BLEServer* pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
@@ -320,7 +438,7 @@ void setup() {
     BLEService* pService = pServer->createService(SERVICE_UUID);
     pCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_READ  |
         BLECharacteristic::PROPERTY_WRITE |
         BLECharacteristic::PROPERTY_NOTIFY
     );
@@ -335,28 +453,44 @@ void setup() {
     pAdv->setMinPreferred(0x12);
     BLEDevice::startAdvertising();
 
-    Serial.printf("🧠 Free heap after BLE: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("🧠 Free after BLE  : %d bytes\n", ESP.getFreeHeap());
     Serial.println("✅ BLE Advertising: 'Memonic'");
 
+    // 3. I2S
     initI2S();
+
+    // Summary
+    Serial.println("─────────────────────────────────");
     Serial.printf("🚀 System Ready | Free heap: %d bytes\n", ESP.getFreeHeap());
-    Serial.println("   AUTO  record: " + String(AUTO_RECORD_SECONDS) + "s = " + String(auto_total_samples * 2 / 1024) + "KB");
-    Serial.println("   ENROLL record: " + String(ENROLL_RECORD_SECONDS) + "s = " + String(enroll_total_samples * 2 / 1024) + "KB");
+    Serial.printf("   AUTO   : %ds = %dKB\n", AUTO_RECORD_SECONDS,   auto_total_samples   * 2 / 1024);
+    Serial.printf("   ENROLL : %ds = %dKB (fallback %ds = %dKB)\n",
+                  ENROLL_RECORD_SECONDS,   enroll_total_samples   * 2 / 1024,
+                  FALLBACK_RECORD_SECONDS, fallback_total_samples * 2 / 1024);
+    Serial.println("─────────────────────────────────");
 }
 
+// ============================================================
+//  Loop
+// ============================================================
 void loop() {
+    // WiFi watchdog
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("⚠️ WiFi lost, reconnecting...");
+        Serial.println("⚠️  WiFi lost — reconnecting...");
         WiFi.begin(ssid, password);
         unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
-            delay(100);
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+            delay(200);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("✅ WiFi reconnected");
+        } else {
+            Serial.println("❌ WiFi reconnect failed — will retry next loop");
         }
     }
 
-    // Periodic heartbeat every 30 seconds
+    // Periodic heartbeat
     static unsigned long lastHeartbeat = 0;
-    if (millis() - lastHeartbeat > 30000) {
+    if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
         sendHeartbeat();
         lastHeartbeat = millis();
     }
