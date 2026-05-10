@@ -44,18 +44,19 @@ const char* serverPath = "/ws/audio";
 #define DMA_BUF_COUNT 8
 #define DMA_BUF_LEN   256
 
-// Ring buffer between I2S task and network: 8KB = 256ms of audio buffering
-#define RING_BUFFER_SIZE 8192
+// Ring buffer between I2S task and network: 32KB = 1s of audio buffering
+// Heap after BLE removal: ~128KB free → 32KB ring buffer is comfortable
+#define RING_BUFFER_SIZE 32768
 
 // --- Globals ---
 WebSocketsClient    webSocket;
 RingbufHandle_t     audioRingBuf = nullptr;
 TaskHandle_t        i2sTaskHandle = nullptr;
 
-volatile bool wsConnected   = false;
-volatile bool isRecording   = false;
-volatile int  targetSamples = 0;
-volatile int  sentSamples   = 0;
+volatile bool          wsConnected       = false;
+volatile bool          isRecording       = false;
+volatile unsigned long recordingStartMs  = 0;   // millis() when recording began
+volatile unsigned long recordingDurationMs = 0; // hard wall-clock limit in ms
 
 // --- Forward Declarations ---
 void startRecording(int seconds, const String& mode, const String& user);
@@ -69,14 +70,27 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_DISCONNECTED:
             wsConnected = false;
             isRecording = false;
-            Serial.println("☁️  WS disconnected");
+            Serial.printf("☁️  WS disconnected | heap: %d | wifi: %d\n",
+                          ESP.getFreeHeap(), WiFi.status());
             break;
 
         case WStype_CONNECTED:
             wsConnected = true;
-            Serial.printf("☁️  WS connected | heap: %d\n", ESP.getFreeHeap());
-            // Tell server we're alive (server uses this to mark bracelet online)
+            Serial.printf("☁️  WS connected: %.*s | heap: %d\n",
+                          (int)length, (char*)payload, ESP.getFreeHeap());
             webSocket.sendTXT("HELLO");
+            break;
+
+        case WStype_ERROR:
+            Serial.printf("☁️  WS ERROR (%u bytes): %.*s\n",
+                          (unsigned)length, (int)length, (char*)payload);
+            break;
+
+        case WStype_PING:
+            Serial.println("☁️  WS ping ←");
+            break;
+        case WStype_PONG:
+            Serial.println("☁️  WS pong ←");
             break;
 
         case WStype_TEXT: {
@@ -94,8 +108,16 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
                 String name = cmd.substring(7);
                 name.trim();
                 startRecording(ENROLL_RECORD_SECONDS, "ENROLL", name);
-            } else if (cmd.equalsIgnoreCase("START")) {
-                startRecording(AUTO_RECORD_SECONDS, "START", "");
+            } else if (cmd.startsWith("START")) {
+                // Accept "START" or "START <n>" — n = seconds (1..30)
+                int seconds = AUTO_RECORD_SECONDS;
+                if (cmd.length() > 5) {
+                    String arg = cmd.substring(5);
+                    arg.trim();
+                    int n = arg.toInt();
+                    if (n >= 1 && n <= 30) seconds = n;
+                }
+                startRecording(seconds, "START", "");
             } else if (cmd.startsWith("SUCCESS") || cmd.startsWith("OK") || cmd.startsWith("ERROR")) {
                 // Result while not recording (late delivery) — just log
                 Serial.printf("✓ Late result: %s\n", cmd.c_str());
@@ -146,10 +168,15 @@ void initI2S() {
 }
 
 void initWebSocket() {
-    webSocket.beginSSL(serverHost, serverPort, serverPath);
+    // beginSslWithCA(host, port, url, NULL) → no cert verification (works
+    // with cloud TLS proxies like Lightning AI). Plain beginSSL on some
+    // ESP32 core versions enforces verification → silent disconnect.
+    webSocket.beginSslWithCA(serverHost, serverPort, serverPath, NULL);
     webSocket.onEvent(onWsEvent);
     webSocket.setReconnectInterval(3000);
-    webSocket.enableHeartbeat(15000, 3000, 2);
+    // NOTE: enableHeartbeat() sends library-specific frames that some
+    // proxies (incl. Lightning AI) drop → instant disconnect.
+    // Rely on TCP keepalive instead. Re-enable only if both sides agree.
     Serial.println("☁️  WSS connecting...");
 }
 
@@ -170,14 +197,14 @@ void startRecording(int seconds, const String& mode, const String& user) {
         vRingbufferReturnItem(audioRingBuf, p);
     }
 
-    targetSamples = SAMPLE_RATE * seconds;
-    sentSamples   = 0;
+    recordingDurationMs = (unsigned long)seconds * 1000UL;
+    recordingStartMs    = millis();   // ← wall-clock lock starts here
 
-    Serial.printf("🎙️  %s%s%s: %ds (%d samples) | heap: %d\n",
+    Serial.printf("🎙️  %s%s%s: %ds (wall-clock lock) | heap: %d\n",
                   mode.c_str(),
                   user.length() ? " " : "",
                   user.c_str(),
-                  seconds, targetSamples, ESP.getFreeHeap());
+                  seconds, ESP.getFreeHeap());
 
     isRecording = true;  // i2sTask + main loop start streaming now
 }
@@ -276,23 +303,16 @@ void loop() {
         return;
     }
 
-    // Drain ring buffer → WSS
-    size_t itemSize;
-    void* item = xRingbufferReceive(audioRingBuf, &itemSize, pdMS_TO_TICKS(20));
-    if (item) {
-        if (wsConnected) {
-            webSocket.sendBIN((uint8_t*)item, itemSize);
-            sentSamples += itemSize / 2;
-        }
-        vRingbufferReturnItem(audioRingBuf, item);
-    }
-
-    // Reached target → stop, drain remaining, send STOP
-    if (sentSamples >= targetSamples) {
+    // ── Wall-clock lock: stop at exactly N seconds ───────────
+    unsigned long elapsed = millis() - recordingStartMs;
+    if (elapsed >= recordingDurationMs) {
         isRecording = false;
 
+        // Drain whatever I2S task already pushed before we stopped it
+        size_t itemSize;
+        void*  item;
         unsigned long drainStart = millis();
-        while (millis() - drainStart < 200) {
+        while (millis() - drainStart < 300) {
             item = xRingbufferReceive(audioRingBuf, &itemSize, pdMS_TO_TICKS(20));
             if (!item) break;
             if (wsConnected) webSocket.sendBIN((uint8_t*)item, itemSize);
@@ -300,7 +320,16 @@ void loop() {
         }
 
         if (wsConnected) webSocket.sendTXT("STOP");
-        Serial.printf("✅ Sent %d samples | heap: %d\n", sentSamples, ESP.getFreeHeap());
-        sentSamples = 0;
+        Serial.printf("✅ Stop at %lums (target %lums) | heap: %d\n",
+                      elapsed, recordingDurationMs, ESP.getFreeHeap());
+        return;
+    }
+
+    // ── Drain ring buffer → WSS ──────────────────────────────
+    size_t itemSize;
+    void* item = xRingbufferReceive(audioRingBuf, &itemSize, pdMS_TO_TICKS(20));
+    if (item) {
+        if (wsConnected) webSocket.sendBIN((uint8_t*)item, itemSize);
+        vRingbufferReturnItem(audioRingBuf, item);
     }
 }
