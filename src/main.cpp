@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
+#include "secrets.h"   // WIFI_SSID, WIFI_PASSWORD — not committed to git
 
 // ============================================================
 //  Memonic — ESP32-S3 Super Mini
@@ -17,9 +18,9 @@
 // ============================================================
 
 // --- WiFi Config ---
-const char* ssid      = "Fais";
-const char* password  = "12345678";
-const char* relayHost = "192.168.1.x";  // ← เปลี่ยนเป็น Mac IP ที่ relay.py print
+const char* ssid      = WIFI_SSID;      // defined in src/secrets.h (git-ignored)
+const char* password  = WIFI_PASSWORD;
+const char* relayHost = "255.255.255.255"; // broadcast — auto-finds phone, no IP config needed
 const int   relayPort = 5005;            // UDP: ESP32 → Mac (audio)
 const int   cmdPort   = 5006;            // UDP: Mac → ESP32 (commands)
 
@@ -146,10 +147,10 @@ void initI2S() {
 }
 
 void initUDP() {
-    udp.begin(cmdPort);  // listen for commands from relay on cmdPort
-    Serial.printf("UDP: sending audio → %s:%d | commands ← :%d\n",
-                  relayHost, relayPort, cmdPort);
-    sendText("HELLO");   // announce ourselves to relay
+    udp.begin(cmdPort);
+    Serial.printf("UDP: broadcast audio → :%d | commands ← :%d\n",
+                  relayPort, cmdPort);
+    sendText("HELLO");   // announce ourselves to whoever is listening on LAN
 }
 
 // ============================================================
